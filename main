@@ -1,0 +1,358 @@
+import cv2 # type: ignore
+import math
+import numpy as np # type: ignore
+import mediapipe as mp # type: ignore
+import time
+import ultralytics # type: ignore
+
+# ----------------- CONFIG & CONSTANTS -----------------
+PERSON_CLASS = 0
+PHONE_CLASS = 67
+
+# Distance Thresholds (Pixels)
+HAND_DISTANCE_THRESHOLD = 60
+PERSON_DISTANCE_THRESHOLD = 100
+IOU_THRESHOLD = 0.4
+
+# Behavior Thresholds
+EAR_SLEEP_THRESHOLD = 0.20  # Eye Aspect Ratio < 0.20 -> Sleeping
+MAR_TALK_THRESHOLD = 0.4   # Mouth Aspect Ratio > 0.4 -> Talking typically
+# Note: MAR threshold depends on landmarks. Will tune.
+# Head Pose Thresholds (Degrees)
+PITCH_DOWN_THRESHOLD = 15  # Looking down > 15 degrees
+YAW_DISTRACTED_THRESHOLD = 25 # Looking left/right > 25 degrees
+
+# Attention Penalties (per frame)
+PENALTY_PHONE = 2.0
+PENALTY_SLEEP = 1.0
+PENALTY_DISTRACTED = 0.5
+PENALTY_TALK = 0.5
+REWARD_ATTENTIVE = 1.0
+
+MAX_ATTENTION = 100
+
+# ----------------- MEDIAPIPE SETUP -----------------
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+    refine_landmarks=True, # Critical for Iris/Eye landmarks
+    max_num_faces=4
+)
+
+# ----------------- STUDENT STATE -----------------
+students = {} 
+# Dictionary structure:
+# {
+#   student_id: {
+#       "bbox": [x1, y1, x2, y2],
+#       "attention": 100.0,
+#       "status": "Attentive",
+#       "color": (0, 255, 0)
+#   }
+# }
+next_student_id = 1
+
+# ----------------- MODELS -----------------
+print("Loading YOLO model...")
+model = ultralytics.YOLO("yolov8n.pt")
+print("YOLO model loaded.")
+
+# ----------------- HELPER FUNCTIONS -----------------
+def calculate_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return inter / (areaA + areaB - inter + 1e-6)
+
+def assign_student_id(bbox):
+    global next_student_id
+    best_iou = 0
+    best_sid = -1
+
+    for sid, data in students.items():
+        iou = calculate_iou(bbox, data["bbox"])
+        if iou > best_iou:
+            best_iou = iou
+            best_sid = sid
+    
+    if best_iou > IOU_THRESHOLD:
+        students[best_sid]["bbox"] = bbox
+        return best_sid
+    else:
+        # New student
+        students[next_student_id] = {
+            "bbox": bbox, 
+            "attention": MAX_ATTENTION,
+            "status": "Attentive",
+            "color": (0, 255, 0),
+            "history": [] # Optional: for smoothing
+        }
+        next_student_id += 1
+        return next_student_id - 1
+
+def distance(p1, p2):
+    return math.dist(p1, p2)
+
+def get_center(box):
+    return int((box[0]+box[2])/2), int((box[1]+box[3])/2)
+
+# --- EAR (Eye Aspect Ratio) ---
+def calculate_ear(landmarks, eye_indices, w, h):
+    # vertical lines
+    v1 = distance(
+        (landmarks[eye_indices[1]].x * w, landmarks[eye_indices[1]].y * h),
+        (landmarks[eye_indices[5]].x * w, landmarks[eye_indices[5]].y * h)
+    )
+    v2 = distance(
+        (landmarks[eye_indices[2]].x * w, landmarks[eye_indices[2]].y * h),
+        (landmarks[eye_indices[4]].x * w, landmarks[eye_indices[4]].y * h)
+    )
+    # horizontal line
+    horiz = distance(
+        (landmarks[eye_indices[0]].x * w, landmarks[eye_indices[0]].y * h),
+        (landmarks[eye_indices[3]].x * w, landmarks[eye_indices[3]].y * h)
+    )
+    return (v1 + v2) / (2.0 * horiz + 1e-6)
+
+# --- MAR (Mouth Aspect Ratio) ---
+def calculate_mar(landmarks, mouth_indices, w, h):
+    # vertical
+    v = distance(
+        (landmarks[mouth_indices[1]].x * w, landmarks[mouth_indices[1]].y * h),
+        (landmarks[mouth_indices[3]].x * w, landmarks[mouth_indices[3]].y * h)
+    )
+    # horizontal
+    horiz = distance(
+        (landmarks[mouth_indices[0]].x * w, landmarks[mouth_indices[0]].y * h),
+        (landmarks[mouth_indices[2]].x * w, landmarks[mouth_indices[2]].y * h)
+    )
+    return v / (horiz + 1e-6)
+
+# --- HEAD POSE ---
+def get_head_pose(landmarks, w, h):
+    # 3D Model Points (Generic)
+    model_points = np.array([
+        (0.0, 0.0, 0.0),             # Nose tip
+        (0.0, -330.0, -65.0),        # Chin
+        (-225.0, 170.0, -135.0),     # Left eye left corner
+        (225.0, 170.0, -135.0),      # Right eye right corner
+        (-150.0, -150.0, -125.0),    # Left Mouth corner
+        (150.0, -150.0, -125.0)      # Right mouth corner
+    ])
+
+    # 2D Image Points from Landmarks
+    # Nose: 1, Chin: 152, Left Eye Left: 33, Right Eye Right: 263, Mouth Left: 61, Mouth Right: 291
+    image_points = np.array([
+        (landmarks[1].x * w, landmarks[1].y * h),
+        (landmarks[152].x * w, landmarks[152].y * h),
+        (landmarks[33].x * w, landmarks[33].y * h),
+        (landmarks[263].x * w, landmarks[263].y * h),
+        (landmarks[61].x * w, landmarks[61].y * h),
+        (landmarks[291].x * w, landmarks[291].y * h)
+    ], dtype="double")
+
+    # Camera Internals (Approximate)
+    focal_length = w
+    center = (w / 2, h / 2)
+    camera_matrix = np.array(
+        [[focal_length, 0, center[0]],
+         [0, focal_length, center[1]],
+         [0, 0, 1]], dtype="double"
+    )
+    dist_coeffs = np.zeros((4, 1))
+
+    # PnP
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs
+    )
+
+    # Euler Angles
+    rmat, jac = cv2.Rodrigues(rotation_vector)
+    angles, mtxR, mtxQ, Qx, Qy, Qz = cv2.RQDecomp3x3(rmat)
+
+    pitch = angles[0] * 360
+    yaw = angles[1] * 360
+    roll = angles[2] * 360
+
+    return pitch, yaw, roll, (int(image_points[0][0]), int(image_points[0][1])) # nose_point
+
+# ----------------- MAIN APP -----------------
+def main():
+    cap = cv2.VideoCapture(0)
+    
+    # Check if webcam opened
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
+
+    # Indices for EAR (Left and Right Eye)
+    # Using specific MediaPipe landmarks
+    LEFT_EYE = [33, 160, 158, 133, 153, 144] 
+    RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+    
+    # Indices for MAR
+    MOUTH = [61, 37, 267, 17] # Left, Top, Right, Bottom
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Optimization: Resize for faster processing?
+        # frame = cv2.resize(frame, (640, 480))
+        h, w, _ = frame.shape
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 1. YOLO Detection
+        results = model(frame, verbose=False, conf=0.5)[0]
+        
+        person_boxes = []
+        phone_boxes = []
+
+        for box in results.boxes:
+            cls = int(box.cls[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            if cls == PERSON_CLASS:
+                person_boxes.append((x1, y1, x2, y2))
+            elif cls == PHONE_CLASS:
+                phone_boxes.append((x1, y1, x2, y2))
+        
+        # 2. Logic Per Person
+        # Reset labels for creating new frame
+        detected_sids = set()
+
+        # Pre-assign tracking IDs to persons
+        tracked_persons = []
+        for pbox in person_boxes:
+            sid = assign_student_id(pbox)
+            detected_sids.add(sid)
+            tracked_persons.append((sid, pbox))
+
+        # Check Phone Usage (Body + Phone proximity)
+        mobile_users = set()
+        for sid, pbox in tracked_persons:
+            p_center = get_center(pbox)
+            for ph_box in phone_boxes:
+                ph_center = get_center(ph_box)
+                if math.dist(p_center, ph_center) < HAND_DISTANCE_THRESHOLD + (pbox[2]-pbox[0])*0.2: # scaling threshold
+                     mobile_users.add(sid)
+
+        # 3. MediaPipe Analysis on Person Crops
+        # To handle multiple faces correctly, we crop the person area and run MP.
+        # However, MP works best on full faces. We will try MP on WHOLE frame
+        # and match landmarks to YOLO boxes. This is more robust for occlusion.
+        
+        mp_results = face_mesh.process(rgb_frame)
+        
+        processed_sids = set()
+
+        if mp_results.multi_face_landmarks:
+            for face_landmarks in mp_results.multi_face_landmarks:
+                # Find which student this face belongs to
+                # We use the nose tip (Landmark 1) to match with YOLO bbox
+                nose = face_landmarks.landmark[1]
+                nx, ny = int(nose.x * w), int(nose.y * h)
+
+                matched_sid = -1
+                for sid, pbox in tracked_persons:
+                    if pbox[0] <= nx <= pbox[2] and pbox[1] <= ny <= pbox[3]:
+                        matched_sid = sid
+                        break
+                
+                if matched_sid == -1: 
+                    continue # Face detected but no body? Ignore.
+                
+                processed_sids.add(matched_sid)
+                
+                # --- HEAD POSE ---
+                pitch, yaw, roll, nose_pt = get_head_pose(face_landmarks.landmark, w, h)
+                
+                # --- EAR (Sleep) ---
+                ear_left = calculate_ear(face_landmarks.landmark, LEFT_EYE, w, h)
+                ear_right = calculate_ear(face_landmarks.landmark, RIGHT_EYE, w, h)
+                ear = (ear_left + ear_right) / 2.0
+                
+                # --- MAR (Talk) ---
+                mar = calculate_mar(face_landmarks.landmark, MOUTH, w, h)
+
+                # --- DECISION LOGIC ---
+                status = "Attentive"
+                penalty = 0
+                color = (0, 255, 0) # Green
+
+                # Hierarchy of distractions
+                if matched_sid in mobile_users:
+                    status = "Using Phone"
+                    penalty = PENALTY_PHONE
+                    color = (0, 0, 255) # Red
+                elif ear < EAR_SLEEP_THRESHOLD:
+                    status = "Sleeping/Drowsy"
+                    penalty = PENALTY_SLEEP
+                    color = (0, 0, 255)
+                elif pitch > PITCH_DOWN_THRESHOLD:
+                    status = "Looking Down"
+                    penalty = PENALTY_DISTRACTED
+                    color = (0, 165, 255) # Orange
+                elif abs(yaw) > YAW_DISTRACTED_THRESHOLD:
+                    status = "Looking Away"
+                    penalty = PENALTY_DISTRACTED
+                    color = (0, 165, 255)
+                elif mar > MAR_TALK_THRESHOLD:
+                    status = "Talking"
+                    penalty = PENALTY_TALK
+                    color = (0, 255, 255) # Yellow
+                else:
+                    status = "Attentive"
+                    penalty = -REWARD_ATTENTIVE # Negative penalty = Reward
+                
+                # Update Student
+                students[matched_sid]["attention"] -= penalty
+                students[matched_sid]["attention"] = max(0, min(100, students[matched_sid]["attention"]))
+                students[matched_sid]["status"] = status
+                students[matched_sid]["color"] = color
+
+                # Debug Draw for Face
+                # cv2.circle(frame, nose_pt, 3, (255,0,255), -1) 
+                
+        # 4. Draw UI
+        for sid, pbox in tracked_persons:
+            data = students[sid]
+            x1, y1, x2, y2 = pbox
+            
+            # If face wasn't detected by MP this frame, imply state from history or default
+            if sid not in processed_sids:
+                if sid in mobile_users: # Still check phone
+                     data["status"] = "Using Phone"
+                     data["attention"] = max(0, data["attention"] - PENALTY_PHONE)
+                     data["color"] = (0, 0, 255)
+                else:
+                    # Fade status? Or assume "Not Visible"
+                    pass
+
+            # Box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), data["color"], 2)
+            
+            # Text Overlay
+            text = f"ID:{sid} | {data['status']} | Attn:{int(data['attention'])}%"
+            
+            # Background for text for readability
+            t_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(frame, (x1, y1 - 25), (x1 + t_size[0], y1), data["color"], -1)
+            cv2.putText(frame, text, (x1, y1 - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        cv2.imshow("Student Behavior Monitoring", frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
