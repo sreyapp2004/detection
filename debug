@@ -1,0 +1,23 @@
+import sys
+import traceback
+
+print(f"Python version: {sys.version}")
+print("Attempting to import mediapipe...")
+try:
+    import mediapipe as mp
+    print(f"MediaPipe version: {mp.__version__}")
+    print("Attempting to access mp.solutions...")
+    try:
+        print(mp.solutions)
+        print("Success!")
+    except AttributeError:
+        print("AttributeError: module 'mediapipe' has no attribute 'solutions'")
+        print("Trying to import mediapipe.python.solutions directly...")
+        try:
+            import mediapipe.python.solutions
+            print("Imported mediapipe.python.solutions successfully")
+        except Exception:
+            traceback.print_exc()
+
+except Exception:
+    traceback.print_exc()
